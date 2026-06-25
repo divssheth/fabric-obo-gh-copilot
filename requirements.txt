@@ -1,0 +1,10 @@
+agent-framework
+mcp
+fastapi
+uvicorn[standard]
+msal
+httpx
+python-jose[cryptography]
+pydantic-settings
+azure-identity
+python-dotenv

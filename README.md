@@ -1,317 +1,292 @@
-# Fabric OBO Runbook (Local + Cloud)
+# Fabric OBO — Backend + MCP Architecture
 
-This runbook documents how to run the active architecture in this repository:
-- Backend API: `backend_gh/main.py`
-- OBO MCP server: `mcp_server_obo/server.py`
-- Frontend: `frontend/index.html`
-
-## Active Architecture (Approach B)
-
-**Approach B** is the canonical baseline:
-- Backend orchestrates via Copilot SDK (CopilotClient) from `github-copilot-sdk`.
-- MCP server (FastMCP) executes tools with header-forwarded OBO for Power BI/Fabric.
-- Frontend bootstraps with MSAL, frontend MSAL config served by backend `/client-config` (no hardcoding).
-- Authentication: fail-closed user-delegated OBO via bearer token validation and MCP token resolver.
-- Security: confused-deputy mitigation via allowlist routing and header forwarding only to configured MCP endpoint.
-
-See [comparison.md](comparison.md) for detailed architecture comparison.
-
-### Note on Approach A
-
-**Approach A** (MAF + Foundry + argument injection) is archived in `archive/approach-a/` and not used by this runbook.
-It injects Fabric token as MCP tool argument instead of using header-forwarded OBO.
-It is retained for reference only.
+This guide covers the complete setup for running the active architecture in this repository:
+- **Backend API**: `backend_gh/main.py` — FastAPI orchestrator via Copilot SDK
+- **OBO MCP Server**: `mcp_server_obo/server.py` — Tool executor for Power BI/Fabric
+- **Frontend**: `frontend/index.html` — MSAL-authenticated SPA
 
 ---
 
-## 1) Architecture and request flow
+## Quick Start (Local)
 
-1. Browser signs in with MSAL and gets a user access token for your backend API scope.
-2. Browser calls backend `/chat` with `Authorization: Bearer <user-token>`.
-3. Backend validates token and forwards that Authorization header only to the configured MCP server.
-4. MCP validates the same user token and performs OBO for Power BI/Fabric.
-5. MCP executes DAX and returns results.
-
-Security highlights:
-- Confused deputy guard in backend: header only forwarded to configured OBO MCP endpoint.
-- Fail-closed auth mode: only `AUTH_MODE=user_delegated` is accepted.
+1. Copy `.env.example` to `.env` and fill in your values (see [Environment Configuration](#environment-configuration))
+2. Create and activate venv:
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
+3. Start three services in separate terminals (see [Running Locally](#running-locally))
+4. Open `http://localhost:5500/frontend/index.html` and sign in
+5. Ask a chat question to verify end-to-end flow
 
 ---
 
-## 2) Prerequisites
+## Architecture Overview
 
-- Python 3.11+ (recommended)
-- Azure tenant where you can create app registrations and managed identities
-- Fabric/Power BI workspace + dataset
+**How it works:**
+
+1. Browser signs in with MSAL → gets user access token for backend API scope
+2. Browser calls backend `/chat` → `Authorization: Bearer <user-token>`
+3. Backend validates token → forwards header only to configured MCP server
+4. MCP validates token → performs OBO for Power BI/Fabric
+5. MCP executes DAX → returns results
+
+**Active approach:** Copilot SDK + header-forwarded OBO (Approach B)
+- Fail-closed user-delegated authentication
+- Confused-deputy mitigation via allowlist routing
+- No secrets passed in arguments; tokens only in headers
+
+**Reference:** [comparison.md](comparison.md) — detailed architecture history. Approach A (MAF + Foundry + argument injection) is archived in `archive/approach-a/` for reference only.
+
+---
+
+## Prerequisites
+
+- Python 3.11+
+- Azure tenant with ability to create app registrations and managed identities
+- Power BI/Fabric workspace + dataset
 - GitHub token for Copilot SDK (`GITHUB_TOKEN`)
 
-Optional for local dev convenience:
-- VS Code Live Server extension (or use Python http server command below)
+Optional: VS Code Live Server extension (or use Python's built-in http.server)
 
 ---
 
-## 3) Azure identity objects you need
+## Azure Identity Setup
 
-Create and keep track of these IDs:
+Create three Azure identity objects:
 
-1. Frontend app registration (SPA)
-   - Used by browser MSAL
-   - Has redirect URI for local and cloud frontend URL
+1. **Frontend app registration (SPA)**
+   - Used by browser MSAL for user sign-in
+   - Redirect URIs: local dev and cloud frontend URLs
 
-2. Backend app registration (Web/API)
-   - This is the API audience for frontend tokens
-   - This is also the confidential client used in OBO
-   - Its client ID becomes `AZURE_CLIENT_ID`
+2. **Backend app registration (Web/API)**
+   - API audience for frontend tokens (backend scope)
+   - Confidential client for OBO credential creation
+   - Client ID becomes `AZURE_CLIENT_ID`
 
-3. User-assigned managed identity (UAMI)
-   - Attached to your cloud runtime
-   - Its client ID becomes `UAMI_CLIENT_ID`
+3. **User-assigned managed identity (UAMI)**
+   - Attached to cloud MCP service runtime
+   - Client ID becomes `UAMI_CLIENT_ID`
+   - Federated with backend app registration for secretless OBO in production
 
----
+### Configuring Backend App (Web/API)
 
-## 4) App registration setup (required for both local and cloud)
+In Azure Portal → Microsoft Entra ID → App registrations → your backend app:
 
-### 4.1 Backend app registration (Web/API)
+1. **Expose an API**
+   - Set Application ID URI: `api://<backend-client-id>`
+   - Add scope: `access_as_user`
 
-In Azure Portal -> Microsoft Entra ID -> App registrations -> your backend app:
+2. **API permissions**
+   - Add delegated permissions for Power BI API
+   - Grant admin consent for your tenant
 
-1. Expose an API
-   - Set Application ID URI (for example `api://<backend-client-id>`)
-   - Add scope `access_as_user`
-
-2. API permissions
-   - Add delegated permissions for Power BI API needed by your queries
-   - Grant admin consent for tenant
-
-3. Authentication
-   - Ensure platform is appropriate for your backend API scenario
-
-4. Federated credentials (for cloud secretless OBO)
-   - Certificates and secrets -> Federated credentials -> Add credential
-   - Credential scenario: Managed identity
+3. **Federated credentials** (for cloud production)
+   - Go to: Certificates and secrets → Federated credentials → Add credential
+   - Scenario: Managed identity
    - Select your UAMI
    - Audience: `api://AzureADTokenExchange`
 
-### 4.2 Frontend app registration (SPA)
+### Configuring Frontend App (SPA)
 
 In your frontend app registration:
 
-1. Authentication
+1. **Authentication**
    - Platform: Single-page application
-   - Add redirect URIs:
+   - Redirect URIs:
      - Local: `http://localhost:5500/frontend/index.html`
-     - Cloud: your hosted frontend URL (for example `https://<frontend-host>/index.html`)
+     - Cloud: `https://<frontend-host>/index.html`
 
-2. API permissions
-   - Add delegated permission to your backend API scope:
-     - `api://<backend-client-id>/access_as_user`
-   - Grant/admin-consent if required by tenant policy
+2. **API permissions**
+   - Add delegated permission: `api://<backend-client-id>/access_as_user`
+   - Grant/admin-consent if required
 
 ---
 
-## 5) Local development setup
+## Local Development
 
-### 5.1 Environment file
+### Environment Configuration
 
-Copy `.env.example` to `.env` and set values.
+Copy `.env.example` to `.env` and populate values:
 
-Minimum local values:
-
-- `AZURE_CLIENT_ID=<backend-app-client-id>`
-- `AZURE_TENANT_ID=<tenant-id>`
-- `ENVIRONMENT=local`
-- `OBO_CLIENT_SECRET=<backend-app-client-secret>`
-- `UAMI_CLIENT_ID=` (can be empty for local secret fallback)
-- `FABRIC_WORKSPACE_ID=<workspace-id>`
-- `FABRIC_DATASET_ID=<dataset-id>`
-- `GITHUB_TOKEN=<github-token>`
-- `OBO_MCP_SERVER_NAME=fabric-obo`
-- `OBO_MCP_SERVER_URL=http://localhost:8002/mcp`
-- `AUTH_MODE=user_delegated`
-- `OBO_API_CLIENT_ID=<backend-app-client-id>`
-- `OBO_REQUIRED_SCOPE=access_as_user`
-- `FRONTEND_ORIGIN=http://localhost:5500`
-- `FRONTEND_BACKEND_URL=http://localhost:8000`
-- `FRONTEND_MSAL_CLIENT_ID=<frontend-app-client-id>`
-- `FRONTEND_MSAL_AUTHORITY=https://login.microsoftonline.com/<tenant-id>`
-- `FRONTEND_MSAL_REDIRECT_URI=http://localhost:5500/frontend/index.html`
-- `FRONTEND_API_SCOPE=api://<backend-app-client-id>/access_as_user`
-
-### 5.2 Install dependencies
-
-```powershell
-cd "C:\Users\divyesheth\OneDrive - Microsoft\Documents\python-projects\fabric-obo"
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+**Essential for local:**
+```
+AZURE_CLIENT_ID=<backend-app-client-id>
+AZURE_TENANT_ID=<tenant-id>
+ENVIRONMENT=local
+OBO_CLIENT_SECRET=<backend-app-client-secret>
+FABRIC_WORKSPACE_ID=<workspace-id>
+FABRIC_DATASET_ID=<dataset-id>
+GITHUB_TOKEN=<github-token>
+OBO_MCP_SERVER_URL=http://localhost:8002/mcp
+FRONTEND_ORIGIN=http://localhost:5500
+FRONTEND_BACKEND_URL=http://localhost:8000
+FRONTEND_MSAL_CLIENT_ID=<frontend-app-client-id>
+FRONTEND_MSAL_AUTHORITY=https://login.microsoftonline.com/<tenant-id>
+FRONTEND_MSAL_REDIRECT_URI=http://localhost:5500/frontend/index.html
+FRONTEND_API_SCOPE=api://<backend-app-client-id>/access_as_user
 ```
 
-### 5.3 Start services (3 terminals)
+See `.env.example` for complete list with inline documentation.
 
-Terminal 1: MCP server
+### Running Locally
+
+**Terminal 1 — MCP server:**
 ```powershell
-cd "C:\Users\divyesheth\OneDrive - Microsoft\Documents\python-projects\fabric-obo"
 .\.venv\Scripts\python mcp_server_obo/server.py
 ```
 
-Terminal 2: Backend API
+**Terminal 2 — Backend API:**
 ```powershell
-cd "C:\Users\divyesheth\OneDrive - Microsoft\Documents\python-projects\fabric-obo"
 .\.venv\Scripts\python -m uvicorn backend_gh.main:app --host 127.0.0.1 --port 8000
 ```
 
-Terminal 3: Frontend static server
+**Terminal 3 — Frontend (static file server):**
 ```powershell
-cd "C:\Users\divyesheth\OneDrive - Microsoft\Documents\python-projects\fabric-obo"
 .\.venv\Scripts\python -m http.server 5500
 ```
 
-Open browser:
-- `http://localhost:5500/frontend/index.html`
+Then open: `http://localhost:5500/frontend/index.html`
 
-### 5.4 Quick health checks
+### Health Checks
 
-1. Backend client config endpoint
 ```powershell
+# Backend client config endpoint
 curl http://localhost:8000/client-config
-```
 
-2. MCP endpoint should be reachable
-```powershell
+# MCP endpoint reachable
 curl http://localhost:8002/mcp
 ```
 
-3. In browser:
-- Sign in
-- Ask a chat question
-- Confirm response appears
+In the browser, sign in and ask a question to verify end-to-end flow works.
 
 ---
 
-## 6) Cloud deployment (recommended: two services + managed identity)
+## Cloud Deployment
 
-Deploy backend and MCP as separate cloud services.
+Deploy backend and MCP as separate services. Reference topology:
+- **Service A (Backend)**: `backend_gh.main:app` on port 8000
+- **Service B (MCP)**: `mcp_server_obo.server` on port 8002
+- **UAMI**: attached to Service B (MCP service)
 
-Reference topology:
-- Service A: backend (`backend_gh.main:app`)
-- Service B: mcp (`mcp_server_obo.server`)
-- UAMI attached to Service B (MCP service)
+Why attach UAMI to MCP?
+- OBO credential creation happens in `mcp_server_obo/obo_auth.py`
+- Must request MI token for `api://AzureADTokenExchange/.default` scope
 
-Why attach UAMI to MCP service:
-- OBO credential creation happens in `mcp_server_obo/obo_auth.py`.
-- That process must be able to request MI token for `api://AzureADTokenExchange/.default`.
+### Backend Service (A) Environment
 
-### 6.1 Cloud environment variables
+```
+AZURE_CLIENT_ID=<backend-app-client-id>
+AZURE_TENANT_ID=<tenant-id>
+FABRIC_WORKSPACE_ID=<workspace-id>
+FABRIC_DATASET_ID=<dataset-id>
+GITHUB_TOKEN=<github-token>
+OBO_MCP_SERVER_URL=https://<mcp-service-host>/mcp
+FRONTEND_ORIGIN=https://<frontend-host>
+FRONTEND_BACKEND_URL=https://<backend-host>
+FRONTEND_MSAL_CLIENT_ID=<frontend-app-client-id>
+FRONTEND_MSAL_AUTHORITY=https://login.microsoftonline.com/<tenant-id>
+FRONTEND_MSAL_REDIRECT_URI=https://<frontend-host>/frontend/index.html
+FRONTEND_API_SCOPE=api://<backend-app-client-id>/access_as_user
+```
 
-Set for Backend service (A):
-- `AZURE_CLIENT_ID`
-- `AZURE_TENANT_ID`
-- `FABRIC_WORKSPACE_ID`
-- `FABRIC_DATASET_ID`
-- `GITHUB_TOKEN`
-- `OBO_MCP_SERVER_NAME=fabric-obo`
-- `OBO_MCP_SERVER_URL=https://<mcp-service-host>/mcp`
-- `AUTH_MODE=user_delegated`
-- `FRONTEND_ORIGIN=https://<frontend-host>`
-- `FRONTEND_BACKEND_URL=https://<backend-host>`
-- `FRONTEND_MSAL_CLIENT_ID`
-- `FRONTEND_MSAL_AUTHORITY`
-- `FRONTEND_MSAL_REDIRECT_URI`
-- `FRONTEND_API_SCOPE`
+### MCP Service (B) Environment
 
-Set for MCP service (B):
-- `AZURE_CLIENT_ID`
-- `AZURE_TENANT_ID`
-- `ENVIRONMENT=production`
-- `UAMI_CLIENT_ID=<uami-client-id>`
-- `OBO_CLIENT_SECRET=` (empty)
-- `FABRIC_WORKSPACE_ID`
-- `FABRIC_DATASET_ID`
-- `OBO_API_CLIENT_ID=<backend-app-client-id>`
-- `OBO_REQUIRED_SCOPE=access_as_user`
-- `AUTH_MODE=user_delegated`
+```
+AZURE_CLIENT_ID=<backend-app-client-id>
+AZURE_TENANT_ID=<tenant-id>
+ENVIRONMENT=production
+UAMI_CLIENT_ID=<uami-client-id>
+OBO_CLIENT_SECRET=<leave empty>
+FABRIC_WORKSPACE_ID=<workspace-id>
+FABRIC_DATASET_ID=<dataset-id>
+OBO_API_CLIENT_ID=<backend-app-client-id>
+OBO_REQUIRED_SCOPE=access_as_user
+```
 
-### 6.2 Federated credential checklist (cloud)
+### Cloud Container Commands
 
-In backend app registration:
-1. Federated credential exists and points to the same UAMI attached to MCP service.
-2. Audience is exactly `api://AzureADTokenExchange`.
-3. Backend app client ID matches `AZURE_CLIENT_ID` in MCP environment.
-4. `UAMI_CLIENT_ID` in MCP env matches attached UAMI.
-
-### 6.3 CORS and redirect URIs
-
-- Backend `FRONTEND_ORIGIN` must match your frontend origin exactly.
-- Frontend app registration must include exact redirect URI used in browser.
-
-### 6.4 Startup commands in cloud containers
-
-Backend container command:
+**Backend:**
 ```bash
 python -m uvicorn backend_gh.main:app --host 0.0.0.0 --port 8000
 ```
 
-MCP container command:
+**MCP:**
 ```bash
 python mcp_server_obo/server.py
 ```
 
----
+### Federated Credential Checklist
 
-## 7) OIDC/federation troubleshooting
+In backend app registration:
+- [ ] Federated credential exists and points to the UAMI attached to MCP service
+- [ ] Audience is exactly `api://AzureADTokenExchange`
+- [ ] Backend app client ID matches `AZURE_CLIENT_ID` in MCP environment
+- [ ] `UAMI_CLIENT_ID` in MCP env matches attached UAMI
 
-### Error: OBO exchange failed / invalid client assertion
+### CORS and Redirect URIs
 
-Check:
-1. Federated credential exists on backend app registration (not frontend app).
-2. UAMI on runtime matches federated credential target.
-3. Audience is `api://AzureADTokenExchange`.
-4. `ENVIRONMENT=production` and `OBO_CLIENT_SECRET` is empty.
-
-### Error: Missing required delegated scope
-
-Check:
-1. Frontend requests `FRONTEND_API_SCOPE` exactly.
-2. Backend app exposes `access_as_user`.
-3. User/token contains scope claim with `access_as_user`.
-
-### Error: Invalid audience in token validation
-
-Check:
-1. `OBO_API_CLIENT_ID` equals backend app client ID.
-2. Frontend token audience is backend API, not Graph/Power BI directly.
-
-### Error: CORS blocked in browser
-
-Check:
-1. `FRONTEND_ORIGIN` matches actual frontend origin.
-2. Access backend via same origin configured in `/client-config`.
-
-### Error: Fabric DatasetExecuteQueriesError / MSOLAP connection
-
-Check:
-1. Dataset ID and workspace ID are correct.
-2. User has rights in workspace/model.
-3. Power BI delegated permissions and tenant settings allow operation.
+- Backend `FRONTEND_ORIGIN` must match your frontend origin exactly
+- Frontend app registration must include the exact redirect URI used in browser
 
 ---
 
-## 8) Validation checklist before go-live
+## Troubleshooting
 
-- [ ] Local login and chat end-to-end succeeds
-- [ ] Cloud login and chat end-to-end succeeds
-- [ ] MCP uses `ENVIRONMENT=production` and no secret fallback
-- [ ] Federated credential is configured and validated
-- [ ] CORS and redirect URIs match production hosts
-- [ ] Logs do not contain secrets
+### OBO exchange failed / invalid client assertion
+
+**Check:**
+1. Federated credential exists on backend app (not frontend)
+2. UAMI on runtime matches federated credential target
+3. Audience is `api://AzureADTokenExchange`
+4. `ENVIRONMENT=production` and `OBO_CLIENT_SECRET` is empty
+
+### Missing required delegated scope
+
+**Check:**
+1. Frontend requests `FRONTEND_API_SCOPE` exactly
+2. Backend app exposes `access_as_user` scope
+3. User/token contains scope claim with `access_as_user`
+
+### Invalid audience in token validation
+
+**Check:**
+1. `OBO_API_CLIENT_ID` equals backend app client ID
+2. Frontend token audience is backend API, not Graph/Power BI directly
+
+### CORS blocked in browser
+
+**Check:**
+1. `FRONTEND_ORIGIN` matches actual frontend origin
+2. Access backend via same origin configured in `/client-config`
+
+### Fabric DatasetExecuteQueriesError / MSOLAP connection
+
+**Check:**
+1. Dataset ID and workspace ID are correct
+2. User has rights in workspace/model
+3. Power BI delegated permissions and tenant settings allow operation
 
 ---
 
-## 9) Useful file references
+## Pre-Go-Live Checklist
 
-- `.env.example`
-- `backend_gh/main.py`
-- `backend_gh/config.py`
-- `mcp_server_obo/server.py`
-- `mcp_server_obo/obo_auth.py`
-- `frontend/app.js`
+- [ ] Local end-to-end signin and chat works
+- [ ] Cloud end-to-end signin and chat works
+- [ ] MCP service: `ENVIRONMENT=production` and `OBO_CLIENT_SECRET` is empty
+- [ ] Federated credential configured on backend app, points to UAMI
+- [ ] CORS and redirect URIs match production hosts exactly
+- [ ] Logs scrubbed of secrets before shipping
+
+---
+
+## Key Files
+
+- `backend_gh/main.py` — FastAPI orchestrator
+- `backend_gh/config.py` — Backend configuration
+- `mcp_server_obo/server.py` — MCP server entry point
+- `mcp_server_obo/obo_auth.py` — Token validation and OBO exchange
+- `frontend/index.html` — SPA entry point
+- `.env.example` — Environment variables template
+- `comparison.md` — Detailed architecture history

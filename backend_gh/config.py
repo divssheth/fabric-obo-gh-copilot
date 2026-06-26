@@ -4,7 +4,6 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Azure App Registration (Backend)
     azure_client_id: str
-    azure_client_secret: str
     azure_tenant_id: str
 
     # Fabric / Power BI

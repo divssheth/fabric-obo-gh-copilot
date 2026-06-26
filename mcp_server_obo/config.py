@@ -1,20 +1,31 @@
-import os
+from pydantic_settings import BaseSettings
 
-from dotenv import load_dotenv
 
-load_dotenv()
+class Settings(BaseSettings):
+	azure_client_id: str = ""
+	azure_tenant_id: str = ""
 
-AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "")
-AZURE_CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET", "")
-AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID", "")
+	# Environment contract:
+	# - local: optional OBO_CLIENT_SECRET fallback for local development.
+	# - production: requires federated workload identity (UAMI_CLIENT_ID).
+	environment: str = "local"
+	uami_client_id: str = ""
+	obo_client_secret: str = ""
 
-FABRIC_WORKSPACE_ID = os.environ.get("FABRIC_WORKSPACE_ID", "")
-FABRIC_DATASET_ID = os.environ.get("FABRIC_DATASET_ID", "")
+	fabric_workspace_id: str = ""
+	fabric_dataset_id: str = ""
 
-# Token validation expectations for header-based OBO mode
-OBO_API_CLIENT_ID = os.environ.get("OBO_API_CLIENT_ID", AZURE_CLIENT_ID)
-OBO_REQUIRED_SCOPE = os.environ.get("OBO_REQUIRED_SCOPE", "access_as_user")
+	# Token validation expectations for header-based OBO mode
+	obo_api_client_id: str = ""
+	obo_required_scope: str = "access_as_user"
 
-# Auth mode for Approach B runtime. Current supported value:
-# - user_delegated: require bearer token and user-scoped OBO flow.
-AUTH_MODE = os.environ.get("AUTH_MODE", "user_delegated")
+	# Auth mode for Approach B runtime. Current supported value:
+	# - user_delegated: require bearer token and user-scoped OBO flow.
+	auth_mode: str = "user_delegated"
+
+	class Config:
+		env_file = ".env"
+		extra = "ignore"
+
+
+settings = Settings()

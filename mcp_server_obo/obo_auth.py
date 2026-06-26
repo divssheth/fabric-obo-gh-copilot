@@ -1,52 +1,59 @@
-import httpx
-import msal
+from azure.identity import ManagedIdentityCredential, OnBehalfOfCredential
 from jose import JWTError, jwt
 
-from .config import (
-    AZURE_CLIENT_ID,
-    AZURE_CLIENT_SECRET,
-    AZURE_TENANT_ID,
-    OBO_API_CLIENT_ID,
-    OBO_REQUIRED_SCOPE,
-)
+from auth_common import get_jwks
+from .config import settings
 
 
 class AuthError(Exception):
     pass
 
 
-_msal_app = msal.ConfidentialClientApplication(
-    client_id=AZURE_CLIENT_ID,
-    client_credential=AZURE_CLIENT_SECRET,
-    authority=f"https://login.microsoftonline.com/{AZURE_TENANT_ID}",
-)
+def _close_credential(credential: object | None) -> None:
+    if credential is None:
+        return
+    close = getattr(credential, "close", None)
+    if callable(close):
+        close()
 
-_jwks_cache: dict | None = None
 
+def _build_obo_credential(
+    user_token: str,
+) -> tuple[OnBehalfOfCredential, ManagedIdentityCredential | None]:
+    # Local development can use a client secret fallback.
+    if settings.environment.lower() == "local" and settings.obo_client_secret:
+        return (
+            OnBehalfOfCredential(
+                tenant_id=settings.azure_tenant_id,
+                client_id=settings.azure_client_id,
+                client_secret=settings.obo_client_secret,
+                user_assertion=user_token,
+            ),
+            None,
+        )
 
-async def _get_jwks() -> dict:
-    global _jwks_cache
-    if _jwks_cache is not None:
-        return _jwks_cache
+    if not settings.uami_client_id:
+        raise AuthError(
+            "UAMI_CLIENT_ID is required for federated OBO outside local-secret mode"
+        )
 
-    openid_config_url = (
-        f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
-        "/v2.0/.well-known/openid-configuration"
+    mi_credential = ManagedIdentityCredential(client_id=settings.uami_client_id)
+
+    def _client_assertion_func() -> str:
+        token = mi_credential.get_token("api://AzureADTokenExchange/.default")
+        return token.token
+
+    obo_credential = OnBehalfOfCredential(
+        tenant_id=settings.azure_tenant_id,
+        client_id=settings.azure_client_id,
+        user_assertion=user_token,
+        client_assertion_func=_client_assertion_func,
     )
-    async with httpx.AsyncClient() as client:
-        config_resp = await client.get(openid_config_url)
-        config_resp.raise_for_status()
-        jwks_uri = config_resp.json()["jwks_uri"]
-
-        keys_resp = await client.get(jwks_uri)
-        keys_resp.raise_for_status()
-        _jwks_cache = keys_resp.json()
-
-    return _jwks_cache
+    return obo_credential, mi_credential
 
 
 async def validate_user_token(token: str) -> dict:
-    jwks = await _get_jwks()
+    jwks = await get_jwks(settings.azure_tenant_id)
 
     try:
         unverified_header = jwt.get_unverified_header(token)
@@ -71,22 +78,23 @@ async def validate_user_token(token: str) -> dict:
         )
 
         token_aud = payload.get("aud", "")
-        valid_audiences = {f"api://{OBO_API_CLIENT_ID}", OBO_API_CLIENT_ID}
+        obo_api_client_id = settings.obo_api_client_id or settings.azure_client_id
+        valid_audiences = {f"api://{obo_api_client_id}", obo_api_client_id}
         if token_aud not in valid_audiences:
             raise AuthError(f"Invalid audience: {token_aud}")
 
         token_iss = payload.get("iss", "")
         valid_issuers = {
-            f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0",
-            f"https://sts.windows.net/{AZURE_TENANT_ID}/",
+            f"https://login.microsoftonline.com/{settings.azure_tenant_id}/v2.0",
+            f"https://sts.windows.net/{settings.azure_tenant_id}/",
         }
         if token_iss not in valid_issuers:
             raise AuthError(f"Invalid issuer: {token_iss}")
 
         scopes = set((payload.get("scp") or "").split())
-        if OBO_REQUIRED_SCOPE and OBO_REQUIRED_SCOPE not in scopes:
+        if settings.obo_required_scope and settings.obo_required_scope not in scopes:
             raise AuthError(
-                f"Missing required delegated scope: {OBO_REQUIRED_SCOPE}"
+                f"Missing required delegated scope: {settings.obo_required_scope}"
             )
 
     except JWTError as e:
@@ -102,14 +110,19 @@ def _extract_bearer_token(authorization_header: str) -> str:
 
 
 def _get_fabric_token_via_obo(user_token: str) -> str:
-    result = _msal_app.acquire_token_on_behalf_of(
-        user_assertion=user_token,
-        scopes=["https://analysis.windows.net/powerbi/api/.default"],
-    )
-    if "access_token" not in result:
-        error = result.get("error_description", result.get("error", "Unknown error"))
-        raise AuthError(f"OBO exchange failed: {error}")
-    return result["access_token"]
+    obo_credential: OnBehalfOfCredential | None = None
+    mi_credential: ManagedIdentityCredential | None = None
+    try:
+        obo_credential, mi_credential = _build_obo_credential(user_token)
+        access_token = obo_credential.get_token(
+            "https://analysis.windows.net/powerbi/api/.default"
+        )
+        return access_token.token
+    except Exception as e:
+        raise AuthError(f"OBO exchange failed: {e}")
+    finally:
+        _close_credential(obo_credential)
+        _close_credential(mi_credential)
 
 
 async def resolve_fabric_token(

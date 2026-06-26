@@ -1,9 +1,9 @@
 import httpx
 import logging
 
-from .config import FABRIC_DATASET_ID, FABRIC_WORKSPACE_ID
+from .config import settings
 
-POWER_BI_BASE = f"https://api.powerbi.com/v1.0/myorg/groups/{FABRIC_WORKSPACE_ID}"
+POWER_BI_BASE = f"https://api.powerbi.com/v1.0/myorg/groups/{settings.fabric_workspace_id}"
 logger = logging.getLogger(__name__)
 
 
@@ -29,7 +29,7 @@ def _raise_for_status_with_details(resp: httpx.Response, operation: str) -> None
 async def get_schema(token: str) -> dict:
     """Fetch tables, columns, and measures from the semantic model via INFO.VIEW.* DAX functions."""
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"{POWER_BI_BASE}/datasets/{FABRIC_DATASET_ID}/executeQueries"
+    url = f"{POWER_BI_BASE}/datasets/{settings.fabric_dataset_id}/executeQueries"
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         tables_resp = await client.post(
@@ -131,7 +131,7 @@ async def get_schema(token: str) -> dict:
 
 async def execute_dax(token: str, dax_query: str) -> list[dict]:
     """Execute a DAX query and return result rows."""
-    url = f"{POWER_BI_BASE}/datasets/{FABRIC_DATASET_ID}/executeQueries"
+    url = f"{POWER_BI_BASE}/datasets/{settings.fabric_dataset_id}/executeQueries"
     headers = {"Authorization": f"Bearer {token}"}
     payload = {
         "queries": [{"query": dax_query}],

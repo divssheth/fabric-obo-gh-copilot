@@ -127,13 +127,17 @@ async def client_config():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest):
+    if settings.auth_mode != "user_delegated":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unsupported AUTH_MODE '{settings.auth_mode}'. Expected 'user_delegated'.",
+        )
+
     auth_header = request.headers.get("authorization", "")
-    user_token: str | None = None
-    if auth_header.startswith("Bearer "):
-        user_token = auth_header[7:]
-        await validate_token(user_token)
-    elif not settings.allow_anonymous_fallback:
+    if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    user_token = auth_header[7:]
+    await validate_token(user_token)
 
     if _client is None:
         raise HTTPException(status_code=503, detail="CopilotClient not initialized")

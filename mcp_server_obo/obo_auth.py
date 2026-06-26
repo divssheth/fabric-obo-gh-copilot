@@ -1,6 +1,5 @@
 import httpx
 import msal
-from azure.identity.aio import DefaultAzureCredential
 from jose import JWTError, jwt
 
 from .config import (
@@ -113,29 +112,22 @@ def _get_fabric_token_via_obo(user_token: str) -> str:
     return result["access_token"]
 
 
-async def _get_fabric_token_via_agent_identity() -> str:
-    credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-    try:
-        token = await credential.get_token(
-            "https://analysis.windows.net/powerbi/api/.default"
-        )
-        return token.token
-    except Exception as e:
-        raise AuthError(f"Agent identity token acquisition failed: {e}")
-    finally:
-        await credential.close()
-
-
-async def resolve_fabric_token(authorization_header: str | None) -> tuple[str, str]:
+async def resolve_fabric_token(
+    authorization_header: str | None,
+    auth_mode: str = "user_delegated",
+) -> tuple[str, str]:
     """Resolve Fabric token.
 
     Returns (token, mode) where mode is one of:
     - user_obo
-    - agent_identity
     """
+    if auth_mode != "user_delegated":
+        raise AuthError(
+            f"Unsupported AUTH_MODE '{auth_mode}'. Expected 'user_delegated'."
+        )
+
     if not authorization_header:
-        token = await _get_fabric_token_via_agent_identity()
-        return token, "agent_identity"
+        raise AuthError("Missing or invalid Authorization header")
 
     user_token = _extract_bearer_token(authorization_header)
     await validate_user_token(user_token)

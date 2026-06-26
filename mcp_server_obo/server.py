@@ -12,6 +12,7 @@ if __package__ in (None, ""):
 
 from mcp_server_obo.fabric_client import get_schema, execute_dax
 from mcp_server_obo.obo_auth import AuthError, resolve_fabric_token
+from mcp_server_obo.config import AUTH_MODE
 
 logging.basicConfig(level=logging.INFO)
 
@@ -36,7 +37,7 @@ def _get_authorization_header(ctx: Context) -> str | None:
 
 async def _resolve_request_fabric_token(ctx: Context) -> tuple[str, str]:
     auth_header = _get_authorization_header(ctx)
-    return await resolve_fabric_token(auth_header)
+    return await resolve_fabric_token(auth_header, auth_mode=AUTH_MODE)
 
 
 @mcp.tool()

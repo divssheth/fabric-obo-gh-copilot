@@ -18,9 +18,9 @@ class Settings(BaseSettings):
     obo_mcp_server_name: str = "fabric-obo"
     obo_mcp_server_url: str = "http://localhost:8002/mcp"
 
-    # If true, /chat allows requests without Authorization header and relies on
-    # MCP-side agent identity fallback. If false, user auth header is required.
-    allow_anonymous_fallback: bool = False
+    # Auth mode for Approach B runtime. Current supported value:
+    # - user_delegated: require bearer token and user-scoped OBO flow.
+    auth_mode: str = "user_delegated"
 
     # Frontend (for CORS)
     frontend_origin: str = "http://localhost:5500"

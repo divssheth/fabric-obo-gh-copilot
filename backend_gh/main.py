@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 import logging
+import uuid
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -22,6 +23,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _client: CopilotClient | None = None
+
+# In-memory session store: session_id -> CopilotSession
+_sessions: dict[str, object] = {}
 
 SYSTEM_MESSAGE = (
     "You are a data analyst assistant with access to a Fabric semantic model via DAX.\n\n"
@@ -62,9 +66,23 @@ def _build_mcp_servers_config(user_token: str | None) -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _client
-    _client = CopilotClient(github_token=settings.github_token)
+    if settings.copilot_auth_mode == "byok":
+        if not settings.azure_openai_endpoint or not settings.azure_openai_api_key:
+            raise RuntimeError("BYOK mode requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY")
+        _client = CopilotClient(
+            env={
+                "AZURE_OPENAI_ENDPOINT": settings.azure_openai_endpoint,
+                "AZURE_OPENAI_API_KEY": settings.azure_openai_api_key,
+                "AZURE_OPENAI_MODEL": settings.azure_openai_model,
+            },
+            use_logged_in_user=False,
+        )
+    else:
+        if not settings.github_token:
+            raise RuntimeError("PAT mode requires GITHUB_TOKEN")
+        _client = CopilotClient(github_token=settings.github_token)
     await _client.start()
-    logger.info("CopilotClient started")
+    logger.info("CopilotClient started (mode=%s)", settings.copilot_auth_mode)
     yield
     await _client.stop()
     logger.info("CopilotClient stopped")
@@ -97,10 +115,12 @@ class ClientConfig(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     reply: str
+    session_id: str
 
 
 @app.get("/client-config", response_model=ClientConfig)
@@ -141,13 +161,20 @@ async def chat(request: Request, body: ChatRequest):
     if _client is None:
         raise HTTPException(status_code=503, detail="CopilotClient not initialized")
 
-    mcp_servers = _build_mcp_servers_config(user_token)
+    session_id = body.session_id
+    session = _sessions.get(session_id) if session_id else None
 
-    session = await _client.create_session(
-        on_permission_request=PermissionHandler.approve_all,
-        system_message={"content": SYSTEM_MESSAGE},
-        mcp_servers=mcp_servers,
-    )
+    # Create a new session if none exists or session_id not provided
+    if session is None:
+        session_id = str(uuid.uuid4())
+        mcp_servers = _build_mcp_servers_config(user_token)
+        session = await _client.create_session(
+            on_permission_request=PermissionHandler.approve_all,
+            system_message={"content": SYSTEM_MESSAGE},
+            mcp_servers=mcp_servers,
+        )
+        _sessions[session_id] = session
+        logger.info("Created new session %s", session_id)
 
     try:
         reply = await session.send_and_wait(body.message)
@@ -159,6 +186,9 @@ async def chat(request: Request, body: ChatRequest):
         if not content:
             content = "No response from the assistant."
 
-        return ChatResponse(reply=content)
-    finally:
-        await session.disconnect()
+        return ChatResponse(reply=content, session_id=session_id)
+    except Exception as e:
+        # If session errored, remove it so next request creates a fresh one
+        _sessions.pop(session_id, None)
+        logger.error("Session %s failed: %s", session_id, e)
+        raise HTTPException(status_code=500, detail=f"Agent error: {e}")

@@ -10,22 +10,15 @@ class Settings(BaseSettings):
     fabric_workspace_id: str
     fabric_dataset_id: str
 
-    # GitHub Copilot
-    github_token: str = ""
-
-    # Copilot auth mode: "pat" (GitHub PAT) or "byok" (Azure OpenAI API key)
-    copilot_auth_mode: str = "pat"
-
-    # BYOK settings (only required when copilot_auth_mode=byok)
-    azure_openai_endpoint: str = ""
-    azure_openai_api_key: str = ""
-    azure_openai_model: str = ""
+    # Azure AI Foundry (LLM inference)
+    foundry_project_endpoint: str
+    foundry_model: str = "gpt-4o"
 
     # OBO MCP Server routing (confused-deputy guard)
     obo_mcp_server_name: str = "fabric-obo"
     obo_mcp_server_url: str = "http://localhost:8002/mcp"
 
-    # Auth mode for Approach B runtime. Current supported value:
+    # Auth mode for runtime. Current supported value:
     # - user_delegated: require bearer token and user-scoped OBO flow.
     auth_mode: str = "user_delegated"
 

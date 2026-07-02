@@ -1,124 +1,184 @@
-# Fabric OBO — Backend + MCP Architecture
+# Fabric OBO — AI Agent + Custom MCP Server with On-Behalf-Of Authentication
 
-This guide covers the complete setup for running the active architecture in this repository:
-- **Backend API**: `backend_gh/main.py` — FastAPI orchestrator via Copilot SDK
-- **OBO MCP Server**: `mcp_server_obo/server.py` — Tool executor for Power BI/Fabric
-- **Frontend**: `frontend/index.html` — MSAL-authenticated SPA
+Connect AI agents to Microsoft Fabric semantic models with user-delegated (OBO) authentication. Each user's queries run under their own identity, respecting existing Fabric permissions.
+
+## Why This Exists
+
+Fabric's Data Agent exposes an MCP endpoint, but your agent sees the Data Agent's data — not each user's permissioned view. The Semantic Model MCP Server (Fabric Toolbox) is great for a single developer in VS Code, but isn't designed for multi-user agents.
+
+This repo solves the enterprise pattern: take a user's identity, exchange it via On-Behalf-Of, and query Fabric as that specific user.
+
+## Architecture
+
+```
+Browser (MSAL sign-in)
+    │
+    ▼  Authorization: Bearer <user-token>
+┌─────────────────────────────────────┐
+│  Backend API (FastAPI)              │
+│  • Validates user token             │
+│  • Orchestrates agent (Copilot SDK  │
+│    or MAF + Foundry)                │
+│  • Forwards token to MCP via header │
+└────────────────┬────────────────────┘
+                 │  Authorization: Bearer <user-token>
+                 ▼
+┌─────────────────────────────────────┐
+│  OBO MCP Server                     │
+│  • Validates user token             │
+│  • OBO exchange → Fabric token      │
+│  • Executes DAX queries as user     │
+└─────────────────────────────────────┘
+                 │
+                 ▼
+         Microsoft Fabric
+       (Semantic Model / DAX)
+```
+
+**Two auth flows, completely isolated:**
+1. **Backend → LLM (inference):** Service identity authenticates to GitHub Copilot or Azure AI Foundry. Nothing to do with the end user.
+2. **Backend → MCP → Fabric (data access):** The end user's token is forwarded to the MCP server, which performs OBO to query Fabric as that user.
+
+---
+
+## Choose Your Orchestrator
+
+| | `backend_gh/` (Copilot SDK) | `backend_maf/` (MAF + Foundry) |
+|---|---|---|
+| **LLM Provider** | GitHub Copilot (PAT) or Azure OpenAI (BYOK) | Azure AI Foundry |
+| **Auth to LLM** | GitHub PAT or Azure OpenAI API key | Entra ID (DefaultAzureCredential) |
+| **Agent Framework** | GitHub Copilot SDK | Microsoft Agent Framework |
+| **MCP Integration** | Native `mcp_servers` config with headers | `MCPStreamableHTTPTool` with custom `http_client` |
+| **Production Story** | BYOK avoids GitHub PAT (uses Azure OpenAI key) | Fully Entra ID — no keys or tokens |
+| **Deployment** | Any compute | Agent on Foundry, MCP on Azure Container Apps |
+
+Both backends expose the same API (`GET /client-config`, `POST /chat`) — the frontend works with either without changes.
+
+---
+
+## Why Two Orchestrators?
+
+Both backends work identically for local development and prototyping. They diverge on **production identity management** — specifically, how the backend authenticates to the LLM provider without requiring personal accounts or manual secret rotation.
+
+### The Account-Linking Problem (Copilot SDK — PAT Mode)
+
+In a multi-user agent, the **LLM inference call is a service-level concern** — the backend calls the model on behalf of the application, not a specific end-user. Only the data access call (Fabric/OBO) needs user identity. A production-ready architecture separates these: service identity → LLM, user identity → data.
+
+The Copilot SDK conflates these two concerns. Every LLM call requires a **GitHub Personal Access Token** tied to a human GitHub account with a Copilot subscription. **GitHub has no equivalent of Azure Managed Identity** — there is no way to say "this compute is authorized to call Copilot" without a personal token.
+
+The SDK's [multi-tenancy guide](https://github.com/github/copilot-sdk/tree/main/docs/setup/multi-tenancy.md) suggests GitHub OAuth per-user as the production pattern, but this doesn't solve the core problem — it just means every end-user must:
+
+1. Have a **GitHub account** (a second identity plane alongside their corporate Entra ID)
+2. Hold an active **Copilot license** (per-seat cost)
+3. Go through a **GitHub OAuth consent flow** (on top of their existing Entra sign-in)
+
+This adds friction and cost without achieving what managed identity provides: a credential-free, human-free service authentication path for the LLM call.
+
+| | Copilot SDK (PAT) | MAF (Managed Identity) |
+|---|---|---|
+| **Who authenticates to LLM?** | A human (via GitHub token) | The compute (via managed identity) |
+| **Humans in the loop for LLM?** | Yes — always | No — zero |
+| **Equivalent to Azure MI?** | Does not exist in GitHub | `DefaultAzureCredential` → system-assigned MI |
+| **Multi-user scaling** | Each user needs GitHub + Copilot seat | Single service identity, unlimited users |
+
+### Copilot SDK — BYOK Mode (Partial Mitigation)
+
+BYOK (Bring Your Own Key) removes the GitHub dependency entirely — no Copilot subscription, no GitHub account. The SDK becomes a pure orchestration runtime that routes to your Azure OpenAI deployment via API key.
+
+However, the SDK's [auth documentation](https://github.com/github/copilot-sdk/tree/main/docs/auth/authenticate.md) notes:
+
+> "BYOK uses key-based authentication only. Microsoft Entra ID (Azure AD), managed identities, and third-party identity providers are not supported."
+
+This means you're managing a **static API key** that must be rotated manually, stored securely, and shared across all sessions. It works — but it's a secret to manage rather than a credential-free identity.
+
+### MAF + Azure AI Foundry (Production-Ready)
+
+The Microsoft Agent Framework authenticates to Azure AI Foundry using `DefaultAzureCredential`, which in production resolves to the compute's **system-assigned managed identity**:
+
+- **No personal accounts** — the service identity is attached to the compute, not a human
+- **No API keys or secrets** — Entra ID handles token issuance and refresh automatically
+- **Standard Azure RBAC** — assign "Azure AI Developer" role to the managed identity
+- **Same identity model** your enterprise already uses for Azure SQL, Key Vault, Storage, etc.
+
+### When to Use Which
+
+| Scenario | Recommended Backend |
+|---|---|
+| Quick local prototyping / exploring Copilot SDK capabilities | `backend_gh/` (PAT mode) |
+| Internal tool where all users have GitHub + Copilot | `backend_gh/` (PAT mode with per-user OAuth) |
+| Prototype without GitHub dependency | `backend_gh/` (BYOK mode) |
+| Production multi-user enterprise app | `backend_maf/` (MAF + Foundry) |
+| Secretless deployment with managed identity | `backend_maf/` (MAF + Foundry) |
+
+> **This repo includes both** so you can prototype quickly with the Copilot SDK and switch to MAF when moving to production — the MCP server, frontend, and auth flow remain identical.
 
 ---
 
 ## Quick Start (Local)
 
-1. Copy `.env.example` to `.env` and fill in your values (see [Environment Configuration](#environment-configuration))
-2. Create and activate venv:
+1. Clone and set up environment:
    ```powershell
+   git clone <repo-url>
+   cd fabric-obo
    python -m venv .venv
    .\.venv\Scripts\Activate.ps1
    pip install -r requirements.txt
    ```
-3. Start three services in separate terminals (see [Running Locally](#running-locally))
-4. Open `http://localhost:5500/frontend/index.html` and sign in
-5. Ask a chat question to verify end-to-end flow
 
----
+2. Copy `.env.example` to `.env` and fill in your values (see [Environment Configuration](#environment-configuration))
 
-## Architecture Overview
+3. Start services in separate terminals:
 
-**How it works:**
+   **Terminal 1 — MCP Server:**
+   ```powershell
+   python mcp_server_obo/server.py
+   ```
 
-1. Browser signs in with MSAL → gets user access token for backend API scope
-2. Browser calls backend `/chat` → `Authorization: Bearer <user-token>`
-3. Backend validates token → forwards header only to configured MCP server
-4. MCP validates token → performs OBO for Power BI/Fabric
-5. MCP executes DAX → returns results
+   **Terminal 2 — Backend (choose one):**
+   ```powershell
+   # Option A: Copilot SDK (PAT mode)
+   python -m uvicorn backend_gh.main:app --host 127.0.0.1 --port 8000
 
-**Active approach:** Copilot SDK + header-forwarded OBO (Approach B)
-- Fail-closed user-delegated authentication
-- Confused-deputy mitigation via allowlist routing
-- No secrets passed in arguments; tokens only in headers
+   # Option B: MAF + Foundry
+   python -m uvicorn backend_maf.main:app --host 127.0.0.1 --port 8000
+   ```
 
-**Reference:** [comparison.md](comparison.md) — detailed architecture history. Approach A (MAF + Foundry + argument injection) is archived in `archive/approach-a/` for reference only.
+   **Terminal 3 — Frontend (choose one):**
+
+   Option A: VS Code Live Server (recommended)
+   - Install the [Live Server extension](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer)
+   - Right-click `frontend/index.html` → "Open with Live Server"
+   - It will serve on `http://localhost:5500` by default
+
+   Option B: Python static server
+   ```powershell
+   python -m http.server 5500
+   ```
+
+4. Open `http://localhost:5500/frontend/index.html`, sign in, and ask a question.
 
 ---
 
 ## Prerequisites
 
 - Python 3.11+
-- Azure tenant with ability to create app registrations and managed identities
-- Power BI/Fabric workspace + dataset
-- GitHub token for Copilot SDK (`GITHUB_TOKEN`)
-
-Optional: VS Code Live Server extension (or use Python's built-in http.server)
-
----
-
-## Azure Identity Setup
-
-Create three Azure identity objects:
-
-1. **Frontend app registration (SPA)**
-   - Used by browser MSAL for user sign-in
-   - Redirect URIs: local dev and cloud frontend URLs
-
-2. **Backend app registration (Web/API)**
-   - API audience for frontend tokens (backend scope)
-   - Confidential client for OBO credential creation
-   - Client ID becomes `AZURE_CLIENT_ID`
-
-3. **User-assigned managed identity (UAMI)**
-   - Attached to cloud MCP service runtime
-   - Client ID becomes `UAMI_CLIENT_ID`
-   - Federated with backend app registration for secretless OBO in production
-
-### Configuring Backend App (Web/API)
-
-In Azure Portal → Microsoft Entra ID → App registrations → your backend app:
-
-1. **Expose an API**
-   - Set Application ID URI: `api://<backend-client-id>`
-   - Add scope: `access_as_user`
-
-2. **API permissions**
-   - Add delegated permissions for Power BI API
-   - Grant admin consent for your tenant
-
-3. **Federated credentials** (for cloud production)
-   - Go to: Certificates and secrets → Federated credentials → Add credential
-   - Scenario: Managed identity
-   - Select your UAMI
-   - Audience: `api://AzureADTokenExchange`
-
-### Configuring Frontend App (SPA)
-
-In your frontend app registration:
-
-1. **Authentication**
-   - Platform: Single-page application
-   - Redirect URIs:
-     - Local: `http://localhost:5500/frontend/index.html`
-     - Cloud: `https://<frontend-host>/index.html`
-
-2. **API permissions**
-   - Add delegated permission: `api://<backend-client-id>/access_as_user`
-   - Grant/admin-consent if required
+- Azure tenant with app registrations and managed identities
+- Power BI / Fabric workspace + semantic model (dataset)
+- **For Copilot SDK (PAT mode):** GitHub token with Copilot access
+- **For Copilot SDK (BYOK mode):** Azure OpenAI endpoint + API key
+- **For MAF:** Azure AI Foundry project endpoint (authenticate via `az login`)
 
 ---
 
-## Local Development
+## Environment Configuration
 
-### Environment Configuration
+### Common Variables (all backends)
 
-Copy `.env.example` to `.env` and populate values:
-
-**Essential for local:**
-```
+```env
 AZURE_CLIENT_ID=<backend-app-client-id>
 AZURE_TENANT_ID=<tenant-id>
-ENVIRONMENT=local
-OBO_CLIENT_SECRET=<backend-app-client-secret>
 FABRIC_WORKSPACE_ID=<workspace-id>
 FABRIC_DATASET_ID=<dataset-id>
-GITHUB_TOKEN=<github-token>
 OBO_MCP_SERVER_URL=http://localhost:8002/mcp
 FRONTEND_ORIGIN=http://localhost:5500
 FRONTEND_BACKEND_URL=http://localhost:8000
@@ -128,165 +188,139 @@ FRONTEND_MSAL_REDIRECT_URI=http://localhost:5500/frontend/index.html
 FRONTEND_API_SCOPE=api://<backend-app-client-id>/access_as_user
 ```
 
-See `.env.example` for complete list with inline documentation.
+### MCP Server Variables
 
-### Running Locally
-
-**Terminal 1 — MCP server:**
-```powershell
-.\.venv\Scripts\python mcp_server_obo/server.py
+```env
+ENVIRONMENT=local
+OBO_CLIENT_SECRET=<backend-app-client-secret>
+OBO_API_CLIENT_ID=<backend-app-client-id>
+OBO_REQUIRED_SCOPE=access_as_user
 ```
 
-**Terminal 2 — Backend API:**
-```powershell
-.\.venv\Scripts\python -m uvicorn backend_gh.main:app --host 127.0.0.1 --port 8000
+### Copilot SDK Backend (`backend_gh/`)
+
+```env
+# PAT mode (default)
+COPILOT_AUTH_MODE=pat
+GITHUB_TOKEN=<github-token>
+
+# OR BYOK mode (Azure OpenAI with API key)
+COPILOT_AUTH_MODE=byok
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
+AZURE_OPENAI_API_KEY=<api-key>
+AZURE_OPENAI_MODEL=gpt-4o
 ```
 
-**Terminal 3 — Frontend (static file server):**
-```powershell
-.\.venv\Scripts\python -m http.server 5500
+### MAF Backend (`backend_maf/`)
+
+```env
+FOUNDRY_PROJECT_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>
+FOUNDRY_MODEL=gpt-4o
 ```
 
-Then open: `http://localhost:5500/frontend/index.html`
+**No API key required.** MAF authenticates to Azure AI Foundry via Entra ID (`DefaultAzureCredential`):
+- **Local:** Uses your `az login` session automatically — just run `az login` before starting the backend.
+- **Production:** Uses Managed Identity on the compute (e.g., system-assigned identity on Azure Container Apps).
+- **Required role:** The identity needs "Azure AI Developer" or "Cognitive Services OpenAI User" on the Foundry project.
 
-### Health Checks
+---
 
-```powershell
-# Backend client config endpoint
-curl http://localhost:8000/client-config
+## Azure Identity Setup
 
-# MCP endpoint reachable
-curl http://localhost:8002/mcp
-```
+Create three Azure identity objects:
 
-In the browser, sign in and ask a question to verify end-to-end flow works.
+1. **Frontend app registration (SPA)**
+   - Platform: Single-page application
+   - Redirect URIs: local + production frontend URLs
+   - API permissions: `api://<backend-client-id>/access_as_user`
+
+2. **Backend app registration (Web/API)**
+   - Expose an API: `api://<backend-client-id>` with scope `access_as_user`
+   - API permissions: Power BI delegated permissions (admin consent)
+   - Client secret (local dev) or federated credential (production)
+
+3. **User-assigned managed identity (UAMI)** — production only
+   - Attached to MCP service runtime (e.g., Azure Container Apps)
+   - Federated with backend app registration for secretless OBO
+   - Audience: `api://AzureADTokenExchange`
 
 ---
 
 ## Cloud Deployment
 
-Deploy backend and MCP as separate services. Reference topology:
-- **Service A (Backend)**: `backend_gh.main:app` on port 8000
-- **Service B (MCP)**: `mcp_server_obo.server` on port 8002
-- **UAMI**: attached to Service B (MCP service)
+| Service | Runtime | Command |
+|---------|---------|---------|
+| Backend (Copilot SDK) | Any compute | `python -m uvicorn backend_gh.main:app --host 0.0.0.0 --port 8000` |
+| Backend (MAF) | Azure AI Foundry / ACA | `python -m uvicorn backend_maf.main:app --host 0.0.0.0 --port 8000` |
+| MCP Server | Azure Container Apps | `python mcp_server_obo/server.py` |
+| Frontend | Static hosting | Serve `frontend/` directory |
 
-Why attach UAMI to MCP?
-- OBO credential creation happens in `mcp_server_obo/obo_auth.py`
-- Must request MI token for `api://AzureADTokenExchange/.default` scope
+### MCP Service (Production) Environment
 
-### Backend Service (A) Environment
-
-```
-AZURE_CLIENT_ID=<backend-app-client-id>
-AZURE_TENANT_ID=<tenant-id>
-FABRIC_WORKSPACE_ID=<workspace-id>
-FABRIC_DATASET_ID=<dataset-id>
-GITHUB_TOKEN=<github-token>
-OBO_MCP_SERVER_URL=https://<mcp-service-host>/mcp
-FRONTEND_ORIGIN=https://<frontend-host>
-FRONTEND_BACKEND_URL=https://<backend-host>
-FRONTEND_MSAL_CLIENT_ID=<frontend-app-client-id>
-FRONTEND_MSAL_AUTHORITY=https://login.microsoftonline.com/<tenant-id>
-FRONTEND_MSAL_REDIRECT_URI=https://<frontend-host>/frontend/index.html
-FRONTEND_API_SCOPE=api://<backend-app-client-id>/access_as_user
-```
-
-### MCP Service (B) Environment
-
-```
-AZURE_CLIENT_ID=<backend-app-client-id>
-AZURE_TENANT_ID=<tenant-id>
+```env
 ENVIRONMENT=production
+AZURE_CLIENT_ID=<backend-app-client-id>
+AZURE_TENANT_ID=<tenant-id>
 UAMI_CLIENT_ID=<uami-client-id>
-OBO_CLIENT_SECRET=<leave empty>
+OBO_CLIENT_SECRET=
 FABRIC_WORKSPACE_ID=<workspace-id>
 FABRIC_DATASET_ID=<dataset-id>
 OBO_API_CLIENT_ID=<backend-app-client-id>
 OBO_REQUIRED_SCOPE=access_as_user
 ```
 
-### Cloud Container Commands
-
-**Backend:**
-```bash
-python -m uvicorn backend_gh.main:app --host 0.0.0.0 --port 8000
-```
-
-**MCP:**
-```bash
-python mcp_server_obo/server.py
-```
-
 ### Federated Credential Checklist
 
-In backend app registration:
-- [ ] Federated credential exists and points to the UAMI attached to MCP service
+- [ ] Federated credential on backend app points to UAMI attached to MCP service
 - [ ] Audience is exactly `api://AzureADTokenExchange`
-- [ ] Backend app client ID matches `AZURE_CLIENT_ID` in MCP environment
 - [ ] `UAMI_CLIENT_ID` in MCP env matches attached UAMI
-
-### CORS and Redirect URIs
-
-- Backend `FRONTEND_ORIGIN` must match your frontend origin exactly
-- Frontend app registration must include the exact redirect URI used in browser
+- [ ] `ENVIRONMENT=production` and `OBO_CLIENT_SECRET` is empty
 
 ---
 
 ## Troubleshooting
 
-### OBO exchange failed / invalid client assertion
-
-**Check:**
-1. Federated credential exists on backend app (not frontend)
-2. UAMI on runtime matches federated credential target
-3. Audience is `api://AzureADTokenExchange`
-4. `ENVIRONMENT=production` and `OBO_CLIENT_SECRET` is empty
-
-### Missing required delegated scope
-
-**Check:**
-1. Frontend requests `FRONTEND_API_SCOPE` exactly
-2. Backend app exposes `access_as_user` scope
-3. User/token contains scope claim with `access_as_user`
-
-### Invalid audience in token validation
-
-**Check:**
-1. `OBO_API_CLIENT_ID` equals backend app client ID
-2. Frontend token audience is backend API, not Graph/Power BI directly
-
-### CORS blocked in browser
-
-**Check:**
-1. `FRONTEND_ORIGIN` matches actual frontend origin
-2. Access backend via same origin configured in `/client-config`
-
-### Fabric DatasetExecuteQueriesError / MSOLAP connection
-
-**Check:**
-1. Dataset ID and workspace ID are correct
-2. User has rights in workspace/model
-3. Power BI delegated permissions and tenant settings allow operation
+| Problem | Check |
+|---------|-------|
+| OBO exchange failed | Federated credential exists on backend app, UAMI matches, audience is `api://AzureADTokenExchange` |
+| Missing delegated scope | Frontend requests correct `FRONTEND_API_SCOPE`, backend exposes `access_as_user` |
+| Invalid audience | `OBO_API_CLIENT_ID` = backend app client ID, frontend token audience = backend API |
+| CORS blocked | `FRONTEND_ORIGIN` matches actual frontend origin exactly |
+| Fabric query error | Dataset/workspace IDs correct, user has workspace access, Power BI permissions granted |
 
 ---
 
-## Pre-Go-Live Checklist
+## Project Structure
 
-- [ ] Local end-to-end signin and chat works
-- [ ] Cloud end-to-end signin and chat works
-- [ ] MCP service: `ENVIRONMENT=production` and `OBO_CLIENT_SECRET` is empty
-- [ ] Federated credential configured on backend app, points to UAMI
-- [ ] CORS and redirect URIs match production hosts exactly
-- [ ] Logs scrubbed of secrets before shipping
+```
+├── backend_gh/          # Copilot SDK backend (PAT or BYOK)
+│   ├── config.py        # Settings with COPILOT_AUTH_MODE toggle
+│   ├── auth.py          # JWT validation
+│   └── main.py          # FastAPI app
+├── backend_maf/         # MAF + Foundry backend
+│   ├── config.py        # Settings with Foundry endpoint
+│   ├── auth.py          # JWT validation
+│   └── main.py          # FastAPI app
+├── mcp_server_obo/      # OBO MCP Server (shared by both backends)
+│   ├── server.py        # MCP endpoint + tools
+│   ├── obo_auth.py      # Token validation + OBO exchange
+│   ├── fabric_client.py # Fabric DAX query execution
+│   └── config.py        # MCP server settings
+├── frontend/            # MSAL-authenticated SPA
+│   ├── index.html
+│   ├── app.js
+│   └── styles.css
+├── auth_common.py       # Shared JWKS fetching
+└── requirements.txt
+```
 
 ---
 
-## Key Files
+## Key Design Decisions
 
-- `backend_gh/main.py` — FastAPI orchestrator
-- `backend_gh/config.py` — Backend configuration
-- `mcp_server_obo/server.py` — MCP server entry point
-- `mcp_server_obo/obo_auth.py` — Token validation and OBO exchange
-- `frontend/index.html` — SPA entry point
-- `.env.example` — Environment variables template
-- `comparison.md` — Detailed architecture history
+- **Fail-closed auth:** Missing or invalid token → request rejected. No fallback to service account.
+- **Confused-deputy guard:** Only the configured MCP server receives the user's bearer token.
+- **Tokens in headers, not arguments:** OBO token flows via HTTP headers, never as tool arguments visible to the model.
+- **Per-request httpx client (MAF):** Each request creates its own `MCPStreamableHTTPTool` with a custom `httpx.AsyncClient` that carries the user's `Authorization` header as a default. This avoids `ContextVar` propagation issues across the MCP transport's internal async tasks — `header_provider` sets headers via a `ContextVar`, but the transport spawns separate tasks where that var is empty.
+- **Same API contract:** Both backends expose identical routes — frontend is backend-agnostic.
+- **Isolated auth paths:** Foundry/Copilot credential (LLM inference) is completely separate from user OBO token (data access).

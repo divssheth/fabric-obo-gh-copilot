@@ -45,14 +45,72 @@ Browser (MSAL sign-in)
 
 | | `backend_gh/` (Copilot SDK) | `backend_maf/` (MAF + Foundry) |
 |---|---|---|
-| **LLM Provider** | GitHub Copilot (PAT) or Azure AI Foundry (BYOK) | Azure AI Foundry |
-| **Auth to LLM** | GitHub PAT or Entra ID (DefaultAzureCredential) | Entra ID (DefaultAzureCredential) |
+| **LLM Provider** | GitHub Copilot (PAT) or Azure OpenAI (BYOK) | Azure AI Foundry |
+| **Auth to LLM** | GitHub PAT or Azure OpenAI API key | Entra ID (DefaultAzureCredential) |
 | **Agent Framework** | GitHub Copilot SDK | Microsoft Agent Framework |
-| **MCP Integration** | Native `mcp_servers` config with headers | `MCPStreamableHTTPTool` with `header_provider` |
-| **Production Story** | BYOK mode removes PAT dependency (Entra ID) | Fully Entra ID — no personal tokens |
+| **MCP Integration** | Native `mcp_servers` config with headers | `MCPStreamableHTTPTool` with custom `http_client` |
+| **Production Story** | BYOK avoids GitHub PAT (uses Azure OpenAI key) | Fully Entra ID — no keys or tokens |
 | **Deployment** | Any compute | Agent on Foundry, MCP on Azure Container Apps |
 
 Both backends expose the same API (`GET /client-config`, `POST /chat`) — the frontend works with either without changes.
+
+---
+
+## Why Two Orchestrators?
+
+Both backends work identically for local development and prototyping. They diverge on **production identity management** — specifically, how the backend authenticates to the LLM provider without requiring personal accounts or manual secret rotation.
+
+### The Account-Linking Problem (Copilot SDK — PAT Mode)
+
+In a multi-user agent, the **LLM inference call is a service-level concern** — the backend calls the model on behalf of the application, not a specific end-user. Only the data access call (Fabric/OBO) needs user identity. A production-ready architecture separates these: service identity → LLM, user identity → data.
+
+The Copilot SDK conflates these two concerns. Every LLM call requires a **GitHub Personal Access Token** tied to a human GitHub account with a Copilot subscription. **GitHub has no equivalent of Azure Managed Identity** — there is no way to say "this compute is authorized to call Copilot" without a personal token.
+
+The SDK's [multi-tenancy guide](https://github.com/github/copilot-sdk/tree/main/docs/setup/multi-tenancy.md) suggests GitHub OAuth per-user as the production pattern, but this doesn't solve the core problem — it just means every end-user must:
+
+1. Have a **GitHub account** (a second identity plane alongside their corporate Entra ID)
+2. Hold an active **Copilot license** (per-seat cost)
+3. Go through a **GitHub OAuth consent flow** (on top of their existing Entra sign-in)
+
+This adds friction and cost without achieving what managed identity provides: a credential-free, human-free service authentication path for the LLM call.
+
+| | Copilot SDK (PAT) | MAF (Managed Identity) |
+|---|---|---|
+| **Who authenticates to LLM?** | A human (via GitHub token) | The compute (via managed identity) |
+| **Humans in the loop for LLM?** | Yes — always | No — zero |
+| **Equivalent to Azure MI?** | Does not exist in GitHub | `DefaultAzureCredential` → system-assigned MI |
+| **Multi-user scaling** | Each user needs GitHub + Copilot seat | Single service identity, unlimited users |
+
+### Copilot SDK — BYOK Mode (Partial Mitigation)
+
+BYOK (Bring Your Own Key) removes the GitHub dependency entirely — no Copilot subscription, no GitHub account. The SDK becomes a pure orchestration runtime that routes to your Azure OpenAI deployment via API key.
+
+However, the SDK's [auth documentation](https://github.com/github/copilot-sdk/tree/main/docs/auth/authenticate.md) notes:
+
+> "BYOK uses key-based authentication only. Microsoft Entra ID (Azure AD), managed identities, and third-party identity providers are not supported."
+
+This means you're managing a **static API key** that must be rotated manually, stored securely, and shared across all sessions. It works — but it's a secret to manage rather than a credential-free identity.
+
+### MAF + Azure AI Foundry (Production-Ready)
+
+The Microsoft Agent Framework authenticates to Azure AI Foundry using `DefaultAzureCredential`, which in production resolves to the compute's **system-assigned managed identity**:
+
+- **No personal accounts** — the service identity is attached to the compute, not a human
+- **No API keys or secrets** — Entra ID handles token issuance and refresh automatically
+- **Standard Azure RBAC** — assign "Azure AI Developer" role to the managed identity
+- **Same identity model** your enterprise already uses for Azure SQL, Key Vault, Storage, etc.
+
+### When to Use Which
+
+| Scenario | Recommended Backend |
+|---|---|
+| Quick local prototyping / exploring Copilot SDK capabilities | `backend_gh/` (PAT mode) |
+| Internal tool where all users have GitHub + Copilot | `backend_gh/` (PAT mode with per-user OAuth) |
+| Prototype without GitHub dependency | `backend_gh/` (BYOK mode) |
+| Production multi-user enterprise app | `backend_maf/` (MAF + Foundry) |
+| Secretless deployment with managed identity | `backend_maf/` (MAF + Foundry) |
+
+> **This repo includes both** so you can prototype quickly with the Copilot SDK and switch to MAF when moving to production — the MCP server, frontend, and auth flow remain identical.
 
 ---
 
@@ -107,7 +165,7 @@ Both backends expose the same API (`GET /client-config`, `POST /chat`) — the f
 - Azure tenant with app registrations and managed identities
 - Power BI / Fabric workspace + semantic model (dataset)
 - **For Copilot SDK (PAT mode):** GitHub token with Copilot access
-- **For Copilot SDK (BYOK mode):** Azure AI Foundry project endpoint (authenticate via `az login`)
+- **For Copilot SDK (BYOK mode):** Azure OpenAI endpoint + API key
 - **For MAF:** Azure AI Foundry project endpoint (authenticate via `az login`)
 
 ---
@@ -146,13 +204,12 @@ OBO_REQUIRED_SCOPE=access_as_user
 COPILOT_AUTH_MODE=pat
 GITHUB_TOKEN=<github-token>
 
-# OR BYOK mode (Azure AI Foundry via Entra ID — no API key)
+# OR BYOK mode (Azure OpenAI with API key)
 COPILOT_AUTH_MODE=byok
-BYOK_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>
-BYOK_FOUNDRY_MODEL=gpt-4o
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
+AZURE_OPENAI_API_KEY=<api-key>
+AZURE_OPENAI_MODEL=gpt-4o
 ```
-
-**BYOK mode uses Entra ID** (`DefaultAzureCredential`) — no API key needed. Run `az login` locally; use Managed Identity in production.
 
 ### MAF Backend (`backend_maf/`)
 
@@ -264,5 +321,6 @@ OBO_REQUIRED_SCOPE=access_as_user
 - **Fail-closed auth:** Missing or invalid token → request rejected. No fallback to service account.
 - **Confused-deputy guard:** Only the configured MCP server receives the user's bearer token.
 - **Tokens in headers, not arguments:** OBO token flows via HTTP headers, never as tool arguments visible to the model.
+- **Per-request httpx client (MAF):** Each request creates its own `MCPStreamableHTTPTool` with a custom `httpx.AsyncClient` that carries the user's `Authorization` header as a default. This avoids `ContextVar` propagation issues across the MCP transport's internal async tasks — `header_provider` sets headers via a `ContextVar`, but the transport spawns separate tasks where that var is empty.
 - **Same API contract:** Both backends expose identical routes — frontend is backend-agnostic.
 - **Isolated auth paths:** Foundry/Copilot credential (LLM inference) is completely separate from user OBO token (data access).

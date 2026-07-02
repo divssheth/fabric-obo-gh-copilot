@@ -13,14 +13,13 @@ class Settings(BaseSettings):
     # GitHub Copilot
     github_token: str = ""
 
-    # Copilot auth mode: "pat" (GitHub PAT) or "byok" (Azure AI Foundry)
+    # Copilot auth mode: "pat" (GitHub PAT) or "byok" (Azure OpenAI API key)
     copilot_auth_mode: str = "pat"
 
     # BYOK settings (only required when copilot_auth_mode=byok)
-    # Uses Entra ID (DefaultAzureCredential) — no API key needed.
-    # Local: az login | Production: Managed Identity
-    byok_foundry_endpoint: str = ""
-    byok_foundry_model: str = ""
+    azure_openai_endpoint: str = ""
+    azure_openai_api_key: str = ""
+    azure_openai_model: str = ""
 
     # OBO MCP Server routing (confused-deputy guard)
     obo_mcp_server_name: str = "fabric-obo"

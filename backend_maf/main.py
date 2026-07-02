@@ -48,14 +48,24 @@ _sessions: dict[str, ConversationSession] = {}
 
 
 def _build_mcp_tool(user_token: str) -> MCPStreamableHTTPTool:
-    """Build MCPStreamableHTTPTool with header_provider for OBO token forwarding."""
+    """Build MCPStreamableHTTPTool with user token injected via httpx default headers."""
     if not settings.obo_mcp_server_url:
         raise HTTPException(status_code=500, detail="OBO MCP server URL is not configured")
+
+    from httpx import AsyncClient, Timeout
+
+    # Create a custom httpx client with the Authorization header baked in.
+    # We create a new MCPStreamableHTTPTool per request, so this is safe.
+    http_client = AsyncClient(
+        follow_redirects=True,
+        timeout=Timeout(30, read=300),
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
 
     return MCPStreamableHTTPTool(
         name=settings.obo_mcp_server_name,
         url=settings.obo_mcp_server_url,
-        header_provider=lambda kwargs: {"Authorization": f"Bearer {kwargs['user_token']}"},
+        http_client=http_client,
         approval_mode="never_require",
     )
 

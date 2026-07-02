@@ -160,7 +160,10 @@ FOUNDRY_PROJECT_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<
 FOUNDRY_MODEL=gpt-4o
 ```
 
-Authenticate via `az login` locally. In production, use Managed Identity.
+**No API key required.** MAF authenticates to Azure AI Foundry via Entra ID (`DefaultAzureCredential`):
+- **Local:** Uses your `az login` session automatically — just run `az login` before starting the backend.
+- **Production:** Uses Managed Identity on the compute (e.g., system-assigned identity on Azure Container Apps).
+- **Required role:** The identity needs "Azure AI Developer" or "Cognitive Services OpenAI User" on the Foundry project.
 
 ---
 

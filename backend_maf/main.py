@@ -1,11 +1,13 @@
 import logging
+import uuid
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent_framework import Agent, MCPStreamableHTTPTool
+from agent_framework import Agent, MCPStreamableHTTPTool, Message
 from agent_framework.foundry import FoundryChatClient
 from azure.identity import DefaultAzureCredential
 
@@ -33,6 +35,16 @@ SYSTEM_MESSAGE = (
     "- If execute_dax_query returns an error, fix the DAX and retry once.\n"
     "- Never fabricate data; only report what the query returns."
 )
+
+
+@dataclass
+class ConversationSession:
+    """Tracks conversation history for multi-turn interactions."""
+    messages: list = field(default_factory=list)
+
+
+# In-memory session store: session_id -> ConversationSession
+_sessions: dict[str, ConversationSession] = {}
 
 
 def _build_mcp_tool(user_token: str) -> MCPStreamableHTTPTool:
@@ -75,10 +87,12 @@ class ClientConfig(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     reply: str
+    session_id: str
 
 
 @app.get("/client-config", response_model=ClientConfig)
@@ -112,6 +126,19 @@ async def chat(request: Request, body: ChatRequest):
     user_token = auth_header[7:]
     await validate_token(user_token)
 
+    # Get or create session
+    session_id = body.session_id
+    if session_id and session_id in _sessions:
+        conv = _sessions[session_id]
+    else:
+        session_id = str(uuid.uuid4())
+        conv = ConversationSession()
+        _sessions[session_id] = conv
+        logger.info("Created new session %s", session_id)
+
+    # Add user message to history
+    conv.messages.append(Message("user", [body.message]))
+
     mcp_tool = _build_mcp_tool(user_token)
 
     credential = DefaultAzureCredential()
@@ -128,7 +155,7 @@ async def chat(request: Request, body: ChatRequest):
         tools=mcp_tool,
     ) as agent:
         result = await agent.run(
-            body.message,
+            conv.messages,
             function_invocation_kwargs={"user_token": user_token},
         )
 
@@ -136,4 +163,7 @@ async def chat(request: Request, body: ChatRequest):
     if not content:
         content = "No response from the assistant."
 
-    return ChatResponse(reply=content)
+    # Add assistant response to history
+    conv.messages.append(Message("assistant", [content]))
+
+    return ChatResponse(reply=content, session_id=session_id)

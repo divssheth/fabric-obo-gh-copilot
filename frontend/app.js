@@ -6,6 +6,7 @@ let msalInstance = null;
 let apiScope = null;
 let backendUrl = null;
 let currentAccount = null;
+let sessionId = null;
 
 async function loadConfig() {
     const resp = await fetch(CONFIG_URL);
@@ -115,13 +116,17 @@ async function sendMessage() {
 
     try {
         const token = await getAccessToken();
+        const requestBody = { message };
+        if (sessionId) {
+            requestBody.session_id = sessionId;
+        }
         const response = await fetch(`${backendUrl}/chat`, {
             method: "POST",
             headers: {
                 "Authorization": `Bearer ${token}`,
                 "Content-Type": "application/json",
             },
-            body: JSON.stringify({ message }),
+            body: JSON.stringify(requestBody),
         });
 
         removeTyping(typingEl);
@@ -133,6 +138,9 @@ async function sendMessage() {
         }
 
         const data = await response.json();
+        if (data.session_id) {
+            sessionId = data.session_id;
+        }
         addMessage(data.reply, "assistant");
     } catch (error) {
         removeTyping(typingEl);

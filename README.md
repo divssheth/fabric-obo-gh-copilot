@@ -85,7 +85,14 @@ Both backends expose the same API (`GET /client-config`, `POST /chat`) — the f
    python -m uvicorn backend_maf.main:app --host 127.0.0.1 --port 8000
    ```
 
-   **Terminal 3 — Frontend:**
+   **Terminal 3 — Frontend (choose one):**
+
+   Option A: VS Code Live Server (recommended)
+   - Install the [Live Server extension](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer)
+   - Right-click `frontend/index.html` → "Open with Live Server"
+   - It will serve on `http://localhost:5500` by default
+
+   Option B: Python static server
    ```powershell
    python -m http.server 5500
    ```

@@ -67,13 +67,12 @@ def _build_mcp_servers_config(user_token: str | None) -> dict:
 async def lifespan(app: FastAPI):
     global _client
     if settings.copilot_auth_mode == "byok":
-        if not settings.azure_openai_endpoint or not settings.azure_openai_api_key:
-            raise RuntimeError("BYOK mode requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY")
+        if not settings.byok_foundry_endpoint:
+            raise RuntimeError("BYOK mode requires BYOK_FOUNDRY_ENDPOINT")
         _client = CopilotClient(
             provider="azure",
-            azure_endpoint=settings.azure_openai_endpoint,
-            azure_api_key=settings.azure_openai_api_key,
-            model=settings.azure_openai_model,
+            azure_endpoint=settings.byok_foundry_endpoint,
+            model=settings.byok_foundry_model,
         )
     else:
         if not settings.github_token:

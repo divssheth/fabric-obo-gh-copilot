@@ -45,11 +45,11 @@ Browser (MSAL sign-in)
 
 | | `backend_gh/` (Copilot SDK) | `backend_maf/` (MAF + Foundry) |
 |---|---|---|
-| **LLM Provider** | GitHub Copilot (PAT) or Azure OpenAI (BYOK) | Azure AI Foundry |
-| **Auth to LLM** | GitHub PAT or Azure OpenAI API key | Entra ID (DefaultAzureCredential) |
+| **LLM Provider** | GitHub Copilot (PAT) or Azure AI Foundry (BYOK) | Azure AI Foundry |
+| **Auth to LLM** | GitHub PAT or Entra ID (DefaultAzureCredential) | Entra ID (DefaultAzureCredential) |
 | **Agent Framework** | GitHub Copilot SDK | Microsoft Agent Framework |
 | **MCP Integration** | Native `mcp_servers` config with headers | `MCPStreamableHTTPTool` with `header_provider` |
-| **Production Story** | BYOK mode removes PAT dependency | Fully Entra ID — no personal tokens |
+| **Production Story** | BYOK mode removes PAT dependency (Entra ID) | Fully Entra ID — no personal tokens |
 | **Deployment** | Any compute | Agent on Foundry, MCP on Azure Container Apps |
 
 Both backends expose the same API (`GET /client-config`, `POST /chat`) — the frontend works with either without changes.
@@ -107,7 +107,7 @@ Both backends expose the same API (`GET /client-config`, `POST /chat`) — the f
 - Azure tenant with app registrations and managed identities
 - Power BI / Fabric workspace + semantic model (dataset)
 - **For Copilot SDK (PAT mode):** GitHub token with Copilot access
-- **For Copilot SDK (BYOK mode):** Azure OpenAI endpoint + API key
+- **For Copilot SDK (BYOK mode):** Azure AI Foundry project endpoint (authenticate via `az login`)
 - **For MAF:** Azure AI Foundry project endpoint (authenticate via `az login`)
 
 ---
@@ -146,12 +146,13 @@ OBO_REQUIRED_SCOPE=access_as_user
 COPILOT_AUTH_MODE=pat
 GITHUB_TOKEN=<github-token>
 
-# OR BYOK mode (Azure OpenAI)
+# OR BYOK mode (Azure AI Foundry via Entra ID — no API key)
 COPILOT_AUTH_MODE=byok
-AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
-AZURE_OPENAI_API_KEY=<api-key>
-AZURE_OPENAI_MODEL=gpt-4o
+BYOK_FOUNDRY_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>
+BYOK_FOUNDRY_MODEL=gpt-4o
 ```
+
+**BYOK mode uses Entra ID** (`DefaultAzureCredential`) — no API key needed. Run `az login` locally; use Managed Identity in production.
 
 ### MAF Backend (`backend_maf/`)
 

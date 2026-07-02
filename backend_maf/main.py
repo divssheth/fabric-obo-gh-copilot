@@ -1,4 +1,3 @@
-from contextlib import asynccontextmanager
 import logging
 
 from dotenv import load_dotenv
@@ -6,9 +5,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from copilot import CopilotClient
-from copilot.session import PermissionHandler
-from copilot.session_events import AssistantMessageData
+from agent_framework import Agent, MCPStreamableHTTPTool
+from agent_framework.foundry import FoundryChatClient
+from azure.identity import DefaultAzureCredential
 
 from .auth import validate_token
 from .config import settings
@@ -20,8 +19,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-_client: CopilotClient | None = None
 
 SYSTEM_MESSAGE = (
     "You are a data analyst assistant with access to a Fabric semantic model via DAX.\n\n"
@@ -38,51 +35,20 @@ SYSTEM_MESSAGE = (
 )
 
 
-def _build_mcp_servers_config(user_token: str | None) -> dict:
-    """Build MCP server config with confused-deputy guard.
+def _build_mcp_tool(user_token: str) -> MCPStreamableHTTPTool:
+    """Build MCPStreamableHTTPTool with header_provider for OBO token forwarding."""
+    if not settings.obo_mcp_server_url:
+        raise HTTPException(status_code=500, detail="OBO MCP server URL is not configured")
 
-    We only attach Authorization to the configured OBO MCP server.
-    """
-    if not settings.obo_mcp_server_name or not settings.obo_mcp_server_url:
-        raise HTTPException(status_code=500, detail="OBO MCP server name/url is not configured")
-
-    server_entry = {
-        "type": "http",
-        "url": settings.obo_mcp_server_url,
-        "tools": ["*"],
-    }
-
-    # Confused-deputy guard: only this server gets the user bearer token.
-    if user_token:
-        server_entry["headers"] = {"Authorization": f"Bearer {user_token}"}
-
-    return {settings.obo_mcp_server_name: server_entry}
+    return MCPStreamableHTTPTool(
+        name=settings.obo_mcp_server_name,
+        url=settings.obo_mcp_server_url,
+        header_provider=lambda kwargs: {"Authorization": f"Bearer {kwargs['user_token']}"},
+        approval_mode="never_require",
+    )
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _client
-    if settings.copilot_auth_mode == "byok":
-        if not settings.azure_openai_endpoint or not settings.azure_openai_api_key:
-            raise RuntimeError("BYOK mode requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY")
-        _client = CopilotClient(
-            provider="azure",
-            azure_endpoint=settings.azure_openai_endpoint,
-            azure_api_key=settings.azure_openai_api_key,
-            model=settings.azure_openai_model,
-        )
-    else:
-        if not settings.github_token:
-            raise RuntimeError("PAT mode requires GITHUB_TOKEN")
-        _client = CopilotClient(github_token=settings.github_token)
-    await _client.start()
-    logger.info("CopilotClient started (mode=%s)", settings.copilot_auth_mode)
-    yield
-    await _client.stop()
-    logger.info("CopilotClient stopped")
-
-
-app = FastAPI(title="Fabric OBO Chat (Copilot SDK)", lifespan=lifespan)
+app = FastAPI(title="Fabric OBO Chat (MAF)")
 
 allowed_origins = {
     settings.frontend_origin,
@@ -117,11 +83,7 @@ class ChatResponse(BaseModel):
 
 @app.get("/client-config", response_model=ClientConfig)
 async def client_config():
-    """Return safe public MSAL config for the frontend to bootstrap MSAL.
-
-    Only safe, non-secret values are exposed here. Never add credentials,
-    tokens, secrets, or internal routing info to this endpoint.
-    """
+    """Return safe public MSAL config for the frontend to bootstrap MSAL."""
     if not settings.frontend_msal_client_id or not settings.frontend_msal_authority:
         raise HTTPException(
             status_code=503,
@@ -150,27 +112,28 @@ async def chat(request: Request, body: ChatRequest):
     user_token = auth_header[7:]
     await validate_token(user_token)
 
-    if _client is None:
-        raise HTTPException(status_code=503, detail="CopilotClient not initialized")
+    mcp_tool = _build_mcp_tool(user_token)
 
-    mcp_servers = _build_mcp_servers_config(user_token)
-
-    session = await _client.create_session(
-        on_permission_request=PermissionHandler.approve_all,
-        system_message={"content": SYSTEM_MESSAGE},
-        mcp_servers=mcp_servers,
+    credential = DefaultAzureCredential()
+    client = FoundryChatClient(
+        credential=credential,
+        project_endpoint=settings.foundry_project_endpoint,
+        model=settings.foundry_model,
     )
 
-    try:
-        reply = await session.send_and_wait(body.message)
+    async with Agent(
+        client=client,
+        name="FabricAnalyst",
+        instructions=SYSTEM_MESSAGE,
+        tools=mcp_tool,
+    ) as agent:
+        result = await agent.run(
+            body.message,
+            function_invocation_kwargs={"user_token": user_token},
+        )
 
-        content = ""
-        if reply and isinstance(reply.data, AssistantMessageData):
-            content = reply.data.content or ""
+    content = result.text if result else ""
+    if not content:
+        content = "No response from the assistant."
 
-        if not content:
-            content = "No response from the assistant."
-
-        return ChatResponse(reply=content)
-    finally:
-        await session.disconnect()
+    return ChatResponse(reply=content)
